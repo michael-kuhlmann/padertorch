@@ -86,6 +86,7 @@ class Wav2Vec2(pt.Module):
         pad: bool = True,
         fading: tp.Optional[tp.Union[str, bool]] = "half",
         attention_fn: tp.Optional[nn.Module] = None,
+        peft_config=None,
     ):
         super().__init__()
         if not freeze and detach:
@@ -105,6 +106,13 @@ class Wav2Vec2(pt.Module):
         self.attention_fn = attention_fn
 
         self._init_model(model_name)
+        if peft_config is not None:
+            if freeze or detach:
+                raise ValueError(
+                    'PEFT with freeze=True or detach=True is not supported.\n'
+                    f'Got: freeze={freeze}, detach={detach}'
+                )
+            self._add_adapter(peft_config)
 
         if self.freeze:
             for param in self.model.parameters():
@@ -131,6 +139,12 @@ class Wav2Vec2(pt.Module):
             window_length=self.window_size,
             pad=self.pad, fading=self.fading,
         )
+
+        if isinstance(self.layer, str) and self.layer.startswith("weighted"):
+            self.layer_weights = torch.nn.Parameter(
+                torch.zeros(1, self.num_layers, 1, 1),
+                requires_grad=True,
+            )
 
     @property
     def d_model(self):
@@ -203,6 +217,15 @@ class Wav2Vec2(pt.Module):
         else:
             raise ValueError(f'Unknown backend: {self.backend}')
 
+    def _add_adapter(self, peft_config):
+        if self.backend == "torchaudio":
+            raise NotImplementedError(
+                "PEFT is not supported for torchaudio backend."
+            )
+        from peft import get_peft_model
+        self.model = get_peft_model(self.model, peft_config)
+        self.model.print_trainable_parameters()
+
     def _get_conv_params(self):
         self.kernel_sizes = list(map(
             lambda layer: layer.conv.kernel_size,
@@ -226,6 +249,8 @@ class Wav2Vec2(pt.Module):
         return x
 
     def _check_shape(self, x: Tensor, sequence_lengths: TSeqLen):
+        if sequence_lengths is None:
+            return
         if isinstance(x, list):
             x = x[-1]
         if x.shape[1] < max(sequence_lengths):
@@ -233,8 +258,7 @@ class Wav2Vec2(pt.Module):
                 "Output shape is smaller than expected:\n"
                 f"Output shape: {x.shape}\n"
                 f"Expected sequence lengths: {sequence_lengths}\n"
-                f"Padded sequence lengths: {sequence_lengths}\n"
-                "Setting pad=True or fading=half will likely fix this issue."
+                f"pad={self.pad}, fading={self.fading}"
             )
 
     def remove_weight_norm(self):
@@ -291,7 +315,6 @@ class Wav2Vec2(pt.Module):
 
     def add_padding(
         self, sequence_lengths, *, signal=None, return_numpy=False,
-        output_sequence_lengths: TSeqLen = None,
     ):
         shift = self.downsample_factor
         length = self.window_size
@@ -377,11 +400,15 @@ class Wav2Vec2(pt.Module):
         return output_lengths
 
     def sample_index_to_frame_index(self, sample_index):
+        if sample_index is None:
+            return None
         if isinstance(sample_index, int):
             sample_index = np.array([sample_index])
         return self._stft.sample_index_to_frame_index(sample_index)
 
     def frame_index_to_sample_index(self, frame_index):
+        if frame_index is None:
+            return None
         return stft_frame_index_to_sample_index(
             frame_index,
             self._stft.window_length,
@@ -431,6 +458,11 @@ class Wav2Vec2(pt.Module):
                 return hidden[-1]
             if self.layer is None:
                 return hidden
+            if self.layer == "weighted":
+                hidden = torch.stack(hidden, dim=1)  # (B, num_layers, T, D)
+                hidden = (self.layer_weights.softmax(dim=1) * hidden)\
+                    .sum(dim=1)  # (B, T, D)
+                return hidden
             raise NotImplementedError(self.layer)
 
         if isinstance(self.layer, int):
@@ -443,6 +475,16 @@ class Wav2Vec2(pt.Module):
             return hidden
         if self.layer is None:
             return hidden[1:]  # Drop input of first Transformer layer
+        if isinstance(self.layer, str) and self.layer.startswith("weighted"):
+            hidden = torch.stack(hidden[1:], dim=1)  # (B, num_layers, T, D)
+            layer_weights = torch.softmax(self.layer_weights, dim=1)
+            if self.layer == "weighted_normalized":
+                # l2 normalization
+                layer_weights = layer_weights * torch.linalg.norm(
+                    hidden.detach().mean(dim=(0, 2), keepdim=True), dim=-1
+                ).unsqueeze(-1)
+            hidden = (layer_weights * hidden).sum(dim=1)  # (B, T, D)
+            return hidden
         raise NotImplementedError(self.layer)
 
     def extract_features_from_latents(
@@ -556,7 +598,12 @@ class Wav2Vec2(pt.Module):
             out_sequence_lengths = self.compute_output_lengths(sequence_lengths)
             z = self.model.feature_extractor(time_signal.float())\
                 .transpose(1, 2)
-            out_sequence_lengths = np.minimum(out_sequence_lengths, z.shape[1])
+            if out_sequence_lengths is not None:
+                out_sequence_lengths = np.array(
+                    to_numpy(out_sequence_lengths, detach=True)
+                )
+                z = z[..., :out_sequence_lengths.max(), :]
+            self._check_shape(z, out_sequence_lengths)
             if return_latents:
                 return z, out_sequence_lengths
 
