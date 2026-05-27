@@ -106,7 +106,7 @@ class WavLM(Wav2Vec2):
 
             # hf backend
             hidden_states = self.model.feature_projection(latents)
-            hidden_states = self.model._mask_hidden_states(hidden_states)
+            hidden_states = self.model._mask_hidden_states(hidden_states[0])
             encoder_outputs = self.model.encoder(
                 hidden_states,
                 output_hidden_states=True,
